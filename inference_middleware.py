@@ -84,7 +84,12 @@ def build_pipeline(pth_path: str = "modelo_control_acceso.pth") -> Dict[str, Any
     )
 
     resnet = InceptionResnetV1(pretrained=None, classify=False)
-    resnet.load_state_dict(checkpoint["facenet_state_dict"])
+    # strict=False: el checkpoint incluye "logits.weight"/"logits.bias"
+    # porque se generó con pretrained="vggface2" (esa variante crea una
+    # capa de clasificación de 8631 clases). Esa capa no se usa para
+    # extraer embeddings faciales (solo se usaría para clasificar),
+    # así que se ignora sin afectar el resto de los pesos.
+    resnet.load_state_dict(checkpoint["facenet_state_dict"], strict=False)
     resnet.eval().to(DEVICE)
 
     return {
