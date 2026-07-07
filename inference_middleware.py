@@ -62,8 +62,16 @@ def build_pipeline(pth_path: str = "modelo_control_acceso.pth") -> Dict[str, Any
     checkpoint = torch.load(pth_path, map_location=DEVICE)
 
     # --- Detector de humanos ---
+    # IMPORTANTE: weights_backbone=None es obligatorio aquí. torchvision
+    # construye una variante distinta del backbone (reduce_tail) según si
+    # weights_backbone es None o no. En prepare_model.py se usó
+    # weights=SSDLite320_MobileNet_V3_Large_Weights.DEFAULT, lo cual fuerza
+    # internamente weights_backbone=None (reduce_tail=True). Si aquí no se
+    # replica exactamente esa combinación, las formas de los tensores no
+    # coinciden y falla el load_state_dict con "size mismatch".
     human_detector = ssdlite320_mobilenet_v3_large(
         weights=None,
+        weights_backbone=None,
         num_classes=checkpoint.get("human_detector_num_classes", 91),
     )
     human_detector.load_state_dict(checkpoint["state_dict"])
