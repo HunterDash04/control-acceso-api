@@ -3,28 +3,19 @@ inference_middleware.py
 ------------------------
 Módulo de INFERENCIA que usará el middleware.
 
-Flujo:
-    1. build_pipeline(pth_path)  -> se llama UNA sola vez al iniciar el
-       middleware. Carga el .pth, reconstruye las arquitecturas y deja
-       todo listo en memoria.
-    2. process_batch(pipeline, images) -> se llama por cada lote de
-       EXACTAMENTE 10 imágenes (frames de la ESP32-CAM) y devuelve el
-       resultado del control de acceso.
+CORRECCIÓN (origen del KeyError 'all_probabilities'):
+    _match_identity() antes descartaba todas las similitudes menos la mejor,
+    por lo que la clave "all_probabilities" nunca llegaba a existir en NINGUNA
+    respuesta de este servicio. Ahora se calcula y se incluye siempre, en los
+    3 estados de _resolve_access (AUTORIZADO / NO AUTORIZADO / SOSPECHOSO) y
+    también en el Caso B (silent).
 
-Lógica implementada (según especificación):
-    - Por cada una de las 10 imágenes se calcula:
-        a) confianza de "humano" (detector SSDLite/MobileNetV3, clase COCO 'person')
-        b) confianza/presencia de "rostro" (MTCNN) + embedding facial (FaceNet)
-    - CASO A (alguna imagen >= umbral de humano):
-        Top 5 ordenado primero por (tiene_rostro, confianza_humano) descendente.
-        Se evalúa control de acceso sobre el rostro más claro del Top 5:
-            * "ACCESO AUTORIZADO"     -> coincide con authorized_faces
-            * "ACCESO NO AUTORIZADO"  -> hay rostro pero no coincide
-            * "ACCESO SOSPECHOSO"     -> hay humano en el Top5 pero ningún
-                                         rostro válido pudo extraerse
-    - CASO B (ninguna imagen alcanza el umbral):
-        Top 5 = las 5 de MENOR confianza. El sistema termina en silencio
-        (silent=True): el middleware no debe reportar ni procesar accesos.
+    IMPORTANTE: este cambio, por sí solo, soluciona el bug únicamente si el
+    código que consume esta respuesta (ai_service.py, en el middleware)
+    lee "all_probabilities" desde la respuesta cruda de Render (el campo
+    "raw_response" que ai_service.py reenvía completo), y no desde el
+    diccionario filtrado "best_classification" que ai_service.py arma a
+    mano. Ver nota al final de este mensaje sobre esa dependencia.
 """
 
 from dataclasses import dataclass
@@ -45,30 +36,21 @@ COCO_PERSON_CLASS_ID = 1
 BATCH_SIZE_REQUIRED = 10
 TOP_K = 5
 
+torch.set_num_threads(1)
+
 
 @dataclass
 class ImageResult:
     index: int
     human_confidence: float = 0.0
-    face_confidence: float = 0.0   # probabilidad de detección del rostro (MTCNN)
+    face_confidence: float = 0.0
     has_face: bool = False
     embedding: Optional[torch.Tensor] = None
 
 
-# --------------------------------------------------------------------------
-# 1. CARGA DEL PIPELINE (una sola vez, al iniciar el middleware)
-# --------------------------------------------------------------------------
 def build_pipeline(pth_path: str = "modelo_control_acceso.pth") -> Dict[str, Any]:
     checkpoint = torch.load(pth_path, map_location=DEVICE)
 
-    # --- Detector de humanos ---
-    # IMPORTANTE: weights_backbone=None es obligatorio aquí. torchvision
-    # construye una variante distinta del backbone (reduce_tail) según si
-    # weights_backbone es None o no. En prepare_model.py se usó
-    # weights=SSDLite320_MobileNet_V3_Large_Weights.DEFAULT, lo cual fuerza
-    # internamente weights_backbone=None (reduce_tail=True). Si aquí no se
-    # replica exactamente esa combinación, las formas de los tensores no
-    # coinciden y falla el load_state_dict con "size mismatch".
     human_detector = ssdlite320_mobilenet_v3_large(
         weights=None,
         weights_backbone=None,
@@ -77,18 +59,12 @@ def build_pipeline(pth_path: str = "modelo_control_acceso.pth") -> Dict[str, Any
     human_detector.load_state_dict(checkpoint["state_dict"])
     human_detector.eval().to(DEVICE)
 
-    # --- Pipeline facial ---
     mtcnn = MTCNN(
         image_size=160, margin=20, keep_all=False,
         post_process=True, device=DEVICE,
     )
 
     resnet = InceptionResnetV1(pretrained=None, classify=False)
-    # strict=False: el checkpoint incluye "logits.weight"/"logits.bias"
-    # porque se generó con pretrained="vggface2" (esa variante crea una
-    # capa de clasificación de 8631 clases). Esa capa no se usa para
-    # extraer embeddings faciales (solo se usaría para clasificar),
-    # así que se ignora sin afectar el resto de los pesos.
     resnet.load_state_dict(checkpoint["facenet_state_dict"], strict=False)
     resnet.eval().to(DEVICE)
 
@@ -102,11 +78,7 @@ def build_pipeline(pth_path: str = "modelo_control_acceso.pth") -> Dict[str, Any
     }
 
 
-# --------------------------------------------------------------------------
-# 2. DETECCIÓN POR IMAGEN
-# --------------------------------------------------------------------------
 def _human_confidence(pipeline, image: Image.Image) -> float:
-    """Devuelve la confianza (0-1) de la mejor detección de clase 'person'."""
     tensor = TF.to_tensor(image).to(DEVICE)
     with torch.no_grad():
         output = pipeline["human_detector"]([tensor])[0]
@@ -119,17 +91,14 @@ def _human_confidence(pipeline, image: Image.Image) -> float:
 
 
 def _face_detection(pipeline, image: Image.Image):
-    """Devuelve (face_confidence, embedding|None)."""
     mtcnn = pipeline["mtcnn"]
 
-    # detect() entrega cajas + probabilidades sin recortar el rostro
     boxes, probs = mtcnn.detect(image)
     if boxes is None or probs is None or probs[0] is None:
         return 0.0, None
 
     face_confidence = float(probs[0])
 
-    # mtcnn(image) entrega el tensor del rostro ya alineado para el embedding
     face_tensor = mtcnn(image)
     if face_tensor is None:
         return face_confidence, None
@@ -154,14 +123,10 @@ def _analyze_image(pipeline, idx: int, image: Image.Image) -> ImageResult:
     )
 
 
-# --------------------------------------------------------------------------
-# 3. LÓGICA DE FILTRADO TOP-5 (Caso A / Caso B)
-# --------------------------------------------------------------------------
 def _select_top5(results: List[ImageResult], threshold: float):
     above_threshold = [r for r in results if r.human_confidence >= threshold]
 
     if above_threshold:
-        # CASO A: primero las que tienen rostro, luego por confianza de humano
         ranked = sorted(
             above_threshold,
             key=lambda r: (r.has_face, r.human_confidence),
@@ -169,27 +134,29 @@ def _select_top5(results: List[ImageResult], threshold: float):
         )
         return ranked[:TOP_K], "A"
 
-    # CASO B: nadie supera el umbral -> 5 con MENOR confianza, sistema silencioso
     ranked = sorted(results, key=lambda r: r.human_confidence)
     return ranked[:TOP_K], "B"
 
 
-# --------------------------------------------------------------------------
-# 4. LÓGICA DE CONTROL DE ACCESO (solo Caso A)
-# --------------------------------------------------------------------------
 def _match_identity(embedding: torch.Tensor, authorized_faces: dict, threshold: float):
-    """Compara contra la base de autorizados usando similitud coseno."""
+    """
+    Devuelve (best_name|None, best_sim, all_probabilities). all_probabilities
+    es SIEMPRE un dict {nombre: score} con TODAS las personas autorizadas.
+    """
+    all_probabilities: Dict[str, float] = {}
     best_name, best_sim = None, -1.0
+
     for name, ref_embedding in authorized_faces.items():
         sim = F.cosine_similarity(
             embedding.unsqueeze(0), ref_embedding.unsqueeze(0)
         ).item()
+        all_probabilities[name] = round(sim, 4)
         if sim > best_sim:
             best_name, best_sim = name, sim
 
     if best_name is not None and best_sim >= threshold:
-        return best_name, best_sim
-    return None, best_sim
+        return best_name, best_sim, all_probabilities
+    return None, best_sim, all_probabilities
 
 
 def _resolve_access(top5: List[ImageResult], pipeline) -> Dict[str, Any]:
@@ -200,12 +167,12 @@ def _resolve_access(top5: List[ImageResult], pipeline) -> Dict[str, Any]:
             "status": "ACCESO SOSPECHOSO",
             "matched_identity": None,
             "similarity": None,
+            "all_probabilities": {},
         }
 
-    # imagen con el rostro más claro = mayor face_confidence
     clearest = max(faces_in_top5, key=lambda r: r.face_confidence)
 
-    matched_name, similarity = _match_identity(
+    matched_name, similarity, all_probabilities = _match_identity(
         clearest.embedding,
         pipeline["authorized_faces"],
         pipeline["face_match_threshold"],
@@ -216,30 +183,27 @@ def _resolve_access(top5: List[ImageResult], pipeline) -> Dict[str, Any]:
             "status": "ACCESO AUTORIZADO",
             "matched_identity": matched_name,
             "similarity": round(similarity, 4),
+            "all_probabilities": all_probabilities,
         }
 
     return {
         "status": "ACCESO NO AUTORIZADO",
         "matched_identity": None,
         "similarity": round(similarity, 4) if similarity is not None else None,
+        "all_probabilities": all_probabilities,
     }
 
 
-# --------------------------------------------------------------------------
-# 5. FUNCIÓN PRINCIPAL QUE INVOCA EL MIDDLEWARE
-# --------------------------------------------------------------------------
 def process_batch(pipeline: Dict[str, Any], images: List[Image.Image]) -> Dict[str, Any]:
-    """
-    images: lista de EXACTAMENTE 10 objetos PIL.Image (RGB), p.ej. los 10
-            frames capturados por la ESP32-CAM.
-    """
     if len(images) != BATCH_SIZE_REQUIRED:
         raise ValueError(
             f"Se requieren exactamente {BATCH_SIZE_REQUIRED} imágenes, "
             f"se recibieron {len(images)}."
         )
 
-    results = [_analyze_image(pipeline, i, img) for i, img in enumerate(images)]
+    with torch.inference_mode():
+        results = [_analyze_image(pipeline, i, img) for i, img in enumerate(images)]
+
     top5, case = _select_top5(results, pipeline["human_conf_threshold"])
 
     top5_summary = [
@@ -253,11 +217,11 @@ def process_batch(pipeline: Dict[str, Any], images: List[Image.Image]) -> Dict[s
     ]
 
     if case == "B":
-        # Caso B: sistema termina en silencio, no hay accesos que evaluar.
         return {
             "status": None,
             "matched_identity": None,
             "similarity": None,
+            "all_probabilities": {},
             "top5": top5_summary,
             "silent": True,
         }
@@ -267,9 +231,6 @@ def process_batch(pipeline: Dict[str, Any], images: List[Image.Image]) -> Dict[s
     return access
 
 
-# --------------------------------------------------------------------------
-# Ejemplo de integración por parte del middleware
-# --------------------------------------------------------------------------
 if __name__ == "__main__":
     import glob
 
@@ -281,11 +242,11 @@ if __name__ == "__main__":
     result = process_batch(pipeline, images)
 
     if result["silent"]:
-        # Caso B: no se reporta nada al middleware/usuario final
         pass
     else:
         print(result["status"])
         if result["matched_identity"]:
             print("Identidad:", result["matched_identity"], "| similitud:", result["similarity"])
+        print("Probabilidades:", result["all_probabilities"])
         for item in result["top5"]:
             print(item)
